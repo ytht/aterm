@@ -10,11 +10,13 @@
 # 运行期生成的便携配置（可能含站点账号密码，禁止上传）
 config.json
 
-# 截图与图片（文档未引用；编译必需的 aterm_favicon.ico 不受影响）
+# 截图与图片（编译必需的 aterm_favicon.ico 不受影响）
 *.png
 *.jpg
 *.jpeg
 *.gif
+# README 引用的界面截图例外，需要随仓库上传
+!screenshots/*.png
 
 # 编辑器 / 系统杂项
 .vscode/
