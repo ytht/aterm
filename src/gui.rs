@@ -1225,6 +1225,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label("ATerm - AI 写的 Term");
                 ui.label(format!("版本：{}", env!("CARGO_PKG_VERSION")));
+                ui.hyperlink_to("GitHub：https://github.com/ytht/aterm", "https://github.com/ytht/aterm");
                 ui.add_space(4.0);
             });
         self.show_about = open;
