@@ -1,0 +1,56 @@
+# 推送 v* 标签（如 v0.2.5）时自动编译 Windows release exe 并发布到 GitHub Release。
+# 也可在 Actions 页面手动触发（workflow_dispatch），手动触发只产出构件、不发布 Release。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Package exe
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") { $ver = "dev" }
+          Copy-Item target/release/aterm.exe "aterm-$ver-windows-x64.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aterm-windows-x64
+          path: aterm-*-windows-x64.exe
+
+      - name: Publish Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: aterm-*-windows-x64.exe
+          generate_release_notes: true

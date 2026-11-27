@@ -1,0 +1,38 @@
+[package]
+name = "aterm"
+version = "0.2.5"
+edition = "2024"
+description = "ATerm —— 面向 BBS 的 Telnet/SSH 终端客户端"
+
+[dependencies]
+# 图形界面：只用 glow（OpenGL）后端，绕开 wgpu/naga，编译更快、依赖更少
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "system_fonts",
+    "accesskit",
+    "clipboard",
+    "links",
+] }
+# SSH：ring 是纯 Rust 加密后端，不需要 NASM/CMake
+russh = { version = "0.65", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+tokio-socks = "0.5"
+arboard = "3.7"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+encoding_rs = "0.8"
+unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+panic = "unwind"

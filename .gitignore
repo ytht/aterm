@@ -1,0 +1,25 @@
+# Rust 编译产物
+/target/
+
+# 历史存档（旧版 exe / zip，不随源码上传）
+/archive/
+
+# 抓包/录制调试数据（仅被 #[ignore] 测试引用，非编译必需）
+*.bin
+
+# 运行期生成的便携配置（可能含站点账号密码，禁止上传）
+config.json
+
+# 截图与图片（文档未引用；编译必需的 aterm_favicon.ico 不受影响）
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# 编辑器 / 系统杂项
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
