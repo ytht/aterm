@@ -112,6 +112,26 @@ pub struct App {
     pre_max_font_size: f32,
     /// 按键宏全局开关（Ctrl+Shift+M 切换；仅本次运行有效，不写入设置文件）
     macros_global: bool,
+    /// 托盘图标（创建失败时为 None，此时关闭仍按原逻辑退出）
+    tray: Option<tray_icon::TrayIcon>,
+    /// 窗口是否已隐藏到托盘
+    hidden: bool,
+    /// 上一次悬停命中的 URL token（变化即重新计时）
+    hover_tok: String,
+    /// 当前 token 的悬停起始时刻
+    hover_since: f64,
+    /// 悬停提示：纯 IP 归属查询结果
+    hover_ip: Option<String>,
+    hover_ip_info: crate::geoip::Slot,
+    /// 悬停提示：图片预览
+    hover_img_url: Option<String>,
+    hover_img: crate::imgprev::Slot,
+    /// 悬停提示窗口锚点（鼠标附近）
+    hover_pos: Pos2,
+    /// 图片预览缩放倍数（滚轮调整，1.0 = 适应窗口的初始大小）
+    hover_img_scale: f32,
+    /// 上一帧图片预览窗的矩形（NONE = 未显示）
+    img_tip_rect: Rect,
 }
 
 use crate::config::Proxy;
@@ -160,7 +180,19 @@ impl App {
             was_maximized: false,
             pre_max_font_size: 0.0,
             macros_global: true,
+            tray: None,
+            hidden: false,
+            hover_tok: String::new(),
+            hover_since: 0.0,
+            hover_ip: None,
+            hover_ip_info: Arc::new(Mutex::new(None)),
+            hover_img_url: None,
+            hover_img: Arc::new(Mutex::new(None)),
+            hover_pos: Pos2::ZERO,
+            hover_img_scale: 1.0,
+            img_tip_rect: Rect::NOTHING,
         };
+        app.tray = create_tray();
         app.tabs.push(Tab::new(
             Site {
                 name: "欢迎".into(),
@@ -409,6 +441,7 @@ impl App {
             t.font_size = 20.0;
         }
         self.update_metrics();
+        self.handle_tray_events(&ctx);
         self.handle_close(&ctx);
 
         // 启动时把窗口移到屏幕正中（等首帧拿到窗口/显示器尺寸后执行一次）。
@@ -493,6 +526,7 @@ impl App {
             self.tabs[idx] = tab;
         });
         self.term_rect = rect;
+        self.url_hover(&ctx, rect);
 
         // 属性窗口（实时调整字号/编码）
         if let Some(ti) = self.props_tab {
@@ -649,9 +683,55 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(60));
     }
 
+    /// 托盘事件：左键/双击图标显示窗口，菜单「退出」真正结束程序。
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        if self.tray.is_none() {
+            return;
+        }
+        while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+            let show = match ev {
+                TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => true,
+                TrayIconEvent::DoubleClick { .. } => true,
+                _ => false,
+            };
+            if show {
+                self.show_from_tray(ctx);
+            }
+        }
+        while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            match ev.id.0.as_str() {
+                "show" => self.show_from_tray(ctx),
+                "quit" => {
+                    // 托盘存在时 handle_close 一律隐藏，这里先摘掉托盘再关窗口
+                    self.tray = None;
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn show_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        restore_main_window();
+        ctx.request_repaint();
+    }
+
     fn handle_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if !requested {
+            return;
+        }
+        // 有托盘：关闭按钮只隐藏窗口，连接与后台任务继续运行。
+        // 隐藏/恢复统一走系统接口（ShowWindow），不用 ViewportCommand::Visible：
+        // 后者与 winit 内部可见状态不同步，恢复后再点关闭会没有反应。
+        if self.tray.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hide_main_window();
+            self.hidden = true;
+            self.status_line = "已最小化到系统托盘：单击托盘图标恢复窗口".into();
             return;
         }
         let alive = self
@@ -1713,6 +1793,35 @@ impl App {
                     }
                 }
                 egui::Event::MouseWheel { unit, delta, .. } => {
+                    // 图片预览窗显示期间：滚轮用于缩放图片，不发 PgUp/PgDn；
+                    // 预览窗消失后自动恢复原来的翻页发送。
+                    if self.img_preview_visible() && delta.y.abs() > 1e-3 {
+                        let steps = match unit {
+                            egui::MouseWheelUnit::Point => (delta.y.abs() / 40.0).max(1.0),
+                            _ => delta.y.abs().max(1.0),
+                        };
+                        let factor = 1.15f32.powf(if delta.y > 0.0 { steps } else { -steps });
+                        // 按当前图片的实际有效范围钳制倍数：到边界后继续滚
+                        // 不再累积，反向滚动立刻生效（无“空滚”死区）
+                        let (lo, hi) = {
+                            let g = self.hover_img.lock().unwrap();
+                            match g.as_ref() {
+                                Some(crate::imgprev::ImgState::Ready(tex)) => {
+                                    let screen = ctx.input(|i| i.content_rect());
+                                    let avail = vec2(
+                                        (screen.width() - 40.0).max(100.0),
+                                        (screen.height() - 40.0).max(100.0),
+                                    );
+                                    img_scale_bounds(tex.size_vec2(), avail)
+                                }
+                                _ => (0.05, 40.0),
+                            }
+                        };
+                        self.hover_img_scale =
+                            (self.hover_img_scale * factor).clamp(lo, hi.max(lo));
+                        used = true;
+                        continue;
+                    }
                     // 滚轮不回溯历史：向上/向下每滑动一格，向远端发一次 PgUp/PgDn
                     let over = ctx.input(|i| i.pointer.interact_pos().unwrap_or(rect.min));
                     if rect.contains(over)
@@ -2379,6 +2488,363 @@ pub fn send_str(conn: &Conn, s: &str, enc: CharEncoding) {
     conn.send(Cmd::Bytes(bytes.into_owned()));
 }
 
+// ---------------------------------------------------- URL 悬停提示
+
+/// 重建某文档行的文本：宽字符补一个空格占位，使字符下标 == 网格列。
+pub fn line_text_at(conn: &Conn, row: usize) -> Option<String> {
+    let t = conn.term.lock().ok()?;
+    let line = t.doc_line(row);
+    let mut text = String::new();
+    for cell in line.iter() {
+        if cell.cont {
+            continue;
+        }
+        text.push(cell.ch);
+        if cell.wide {
+            text.push(' ');
+        }
+    }
+    Some(text)
+}
+
+/// 纯 IP token：无协议、无路径、无查询；带掩码时按旧逻辑把 `*` 段补 0。
+pub fn bare_ip_token(tok: &str) -> Option<String> {
+    if tok.contains("://") || tok.contains(['/', '?', '#']) {
+        return None;
+    }
+    if is_bare_ipv4(tok) {
+        return Some(tok.to_string());
+    }
+    normalize_masked_ip(tok)
+}
+
+impl App {
+    /// 鼠标移动时识别 URL：命中即变手型；停留超过 500ms 弹提示窗口
+    /// （纯 IP → 归属查询；http/https 图片 → 图片预览）。点击行为不变。
+    fn url_hover(&mut self, ctx: &egui::Context, rect: Rect) {
+        let now = ctx.input(|i| i.time);
+        let pos = ctx.input(|i| i.pointer.latest_pos());
+        let dragging = self.tabs.get(self.active).map(|t| t.dragging).unwrap_or(false);
+        let idle = self.dlg == Dlg::None && self.props_tab.is_none() && !dragging;
+        let mut hit: Option<(String, UrlAction)> = None;
+        if idle
+            && let Some(p) = pos
+            && rect.contains(p)
+            && let Some(tab) = self.tabs.get(self.active)
+        {
+            let at = self.cell_at(p, rect, tab);
+            if let Some(conn) = &tab.conn
+                && let Some(text) = line_text_at(conn, at.0)
+            {
+                hit = url_at(&text, at.1);
+            }
+        }
+        let Some((tok, action)) = hit else {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
+            // 鼠标移到图片预览窗上时保持显示（便于滚轮缩放）
+            if self.img_preview_visible()
+                && let Some(p) = pos
+                && self.img_tip_rect.expand(4.0).contains(p)
+            {
+                self.draw_img_hover(ctx);
+                return;
+            }
+            self.hover_tok.clear();
+            self.hover_ip = None;
+            self.hover_img_url = None;
+            self.img_tip_rect = Rect::NOTHING;
+            return;
+        };
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if tok != self.hover_tok {
+            self.hover_tok = tok.clone();
+            self.hover_since = now;
+            self.hover_ip = None;
+            self.hover_img_url = None;
+            *self.hover_ip_info.lock().unwrap() = None;
+            *self.hover_img.lock().unwrap() = None;
+            self.hover_img_scale = 1.0;
+            self.img_tip_rect = Rect::NOTHING;
+        }
+        if now - self.hover_since < 0.5 {
+            ctx.request_repaint_after(Duration::from_millis(60));
+            return;
+        }
+        let anchor = pos.unwrap_or(rect.min);
+        // 纯 IP 优先：命中后只查归属，不再判定是否图片
+        if let Some(ip) = bare_ip_token(&tok) {
+            if self.hover_ip.as_deref() != Some(ip.as_str()) {
+                self.hover_ip = Some(ip.clone());
+                self.hover_pos = anchor;
+                *self.hover_ip_info.lock().unwrap() = None;
+                crate::geoip::spawn_lookup(&self.rt, ip, self.hover_ip_info.clone());
+            }
+            self.draw_ip_hover(ctx);
+            return;
+        }
+        // 图片：必须带 http/https 协议且文件名是常见图片格式；其余一律不弹窗
+        if let UrlAction::Browser(u) = &action
+            && crate::imgprev::image_url(u)
+        {
+            if self.hover_img_url.as_deref() != Some(u.as_str()) {
+                self.hover_img_url = Some(u.clone());
+                self.hover_pos = anchor;
+                self.hover_img_scale = 1.0;
+                self.img_tip_rect = Rect::NOTHING;
+                *self.hover_img.lock().unwrap() = Some(crate::imgprev::ImgState::Loading);
+                crate::imgprev::spawn_fetch(&self.rt, ctx.clone(), u.clone(), self.hover_img.clone());
+            }
+            self.draw_img_hover(ctx);
+        }
+    }
+
+    /// 鼠标附近的提示窗口位置（右下方偏移，超出屏幕则翻到另一侧）。
+    fn hover_window_pos(&self, ctx: &egui::Context) -> Pos2 {
+        let screen = ctx.input(|i| i.content_rect());
+        let mut p = self.hover_pos + vec2(14.0, 18.0);
+        if p.x + 280.0 > screen.right() {
+            p.x = (self.hover_pos.x - 294.0).max(screen.left());
+        }
+        if p.y + 120.0 > screen.bottom() {
+            p.y = (self.hover_pos.y - 130.0).max(screen.top());
+        }
+        p
+    }
+
+    fn draw_ip_hover(&mut self, ctx: &egui::Context) {
+        let info = self.hover_ip_info.lock().unwrap().clone();
+        // 数据库缺失/无记录时静默：不显示任何窗口
+        let Some(info) = info else { return };
+        let pos = self.hover_window_pos(ctx);
+        egui::Area::new(egui::Id::new("ip_hover_tip"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.label(format!("IP来源：{}", info.text));
+                });
+            });
+    }
+
+    /// 图片预览窗当前是否显示（显示期间滚轮用于缩放）。
+    fn img_preview_visible(&self) -> bool {
+        self.hover_img_url.is_some() && self.img_tip_rect != Rect::NOTHING
+    }
+
+    /// 按缩放倍数算出图片显示尺寸：保持比例、不截断，
+    /// 最大 1920×1440、最小 100×100，并且不超出窗口可视区。
+    fn img_display_size(&self, ctx: &egui::Context, natural: Vec2) -> Vec2 {
+        let screen = ctx.input(|i| i.content_rect());
+        let avail = vec2(
+            (screen.width() - 40.0).max(100.0),
+            (screen.height() - 40.0).max(100.0),
+        );
+        img_zoom_size(natural, self.hover_img_scale, avail)
+    }
+
+    fn draw_img_hover(&mut self, ctx: &egui::Context) {
+        enum View {
+            None,
+            Loading,
+            Failed(String),
+            Ready(egui::TextureHandle),
+        }
+        let view = {
+            let g = self.hover_img.lock().unwrap();
+            match g.as_ref() {
+                None => View::None,
+                Some(crate::imgprev::ImgState::Loading) => View::Loading,
+                Some(crate::imgprev::ImgState::Failed(e)) => View::Failed(e.clone()),
+                Some(crate::imgprev::ImgState::Ready(t)) => View::Ready(t.clone()),
+            }
+        };
+        let loading = matches!(view, View::Loading);
+        let size = match &view {
+            View::Ready(tex) => Some(self.img_display_size(ctx, tex.size_vec2())),
+            _ => None,
+        };
+        // 窗口按内容尺寸摆放，整体落在可视区内
+        let screen = ctx.input(|i| i.content_rect());
+        let (cw, ch) = size.map(|s| (s.x + 20.0, s.y + 20.0)).unwrap_or((260.0, 60.0));
+        let mut pos = self.hover_pos + vec2(14.0, 18.0);
+        if pos.x + cw > screen.right() {
+            pos.x = (screen.right() - cw).max(screen.left());
+        }
+        if pos.y + ch > screen.bottom() {
+            pos.y = (screen.bottom() - ch).max(screen.top());
+        }
+        let resp = egui::Area::new(egui::Id::new("img_hover_tip"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    match (&view, size) {
+                        (View::Ready(tex), Some(s)) => {
+                            ui.add(egui::Image::from_texture(tex).fit_to_exact_size(s));
+                        }
+                        (View::Failed(e), _) => {
+                            ui.label(e.clone());
+                        }
+                        (View::Loading, _) => {
+                            ui.label("正在载入图片…");
+                        }
+                        _ => {}
+                    }
+                });
+            });
+        self.img_tip_rect = resp.response.rect;
+        if loading {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+}
+
+/// 图片预览的基准显示框（缩放倍数 1.0 时的最大外框）。
+fn img_box_bounds(natural: Vec2) -> (f32, f32) {
+    let _ = natural;
+    (512.0, 384.0)
+}
+
+/// 当前图片在给定可视区内的有效缩放倍数范围 (最小, 最大)。
+/// 滚轮把倍数钳在此区间内，避免到边界后继续累积造成反向“空滚”。
+pub fn img_scale_bounds(natural: Vec2, avail: Vec2) -> (f32, f32) {
+    let nx = natural.x.max(1.0);
+    let ny = natural.y.max(1.0);
+    let (bw, bh) = img_box_bounds(natural);
+    let base = (bw / nx).min(bh / ny).min(1.0).max(1e-6);
+    // 上限：1920×1440 与可视区共同约束
+    let hi = (1920.0 / nx).min(1440.0 / ny).min(avail.x / nx).min(avail.y / ny) / base;
+    // 下限：两边都不小于 100
+    let lo = (100.0 / nx).max(100.0 / ny) / base;
+    (lo.max(1e-4), hi.max(lo))
+}
+
+/// 滚轮缩放后的显示尺寸（供测试校验上下限与比例）。
+pub fn img_zoom_size(natural: Vec2, scale: f32, avail: Vec2) -> Vec2 {
+    let (bw, bh) = img_box_bounds(natural);
+    let base = (bw / natural.x.max(1.0)).min(bh / natural.y.max(1.0)).min(1.0);
+    let s = base * scale;
+    let mut w = natural.x * s;
+    let mut h = natural.y * s;
+    let cap = (1920.0 / w).min(1440.0 / h).min(1.0);
+    w *= cap;
+    h *= cap;
+    let floor = (100.0 / w).max(100.0 / h).max(1.0);
+    w *= floor;
+    h *= floor;
+    let fit = (avail.x / w).min(avail.y / h).min(1.0);
+    vec2((w * fit).max(1.0), (h * fit).max(1.0))
+}
+
+/// 创建托盘图标与右键菜单（失败返回 None，程序退化为原来的关闭即退出）。
+fn create_tray() -> Option<tray_icon::TrayIcon> {
+    let icon = crate::icon_rgba(32)?;
+    let icon = tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()?;
+    let menu = tray_icon::menu::Menu::new();
+    let show = tray_icon::menu::MenuItem::with_id("show", "显示 ATerm", true, None);
+    let quit = tray_icon::menu::MenuItem::with_id("quit", "退出 ATerm", true, None);
+    menu.append(&show).ok()?;
+    menu.append(&quit).ok()?;
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_icon(icon)
+        .with_tooltip("ATerm")
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()
+        .ok()?;
+    // 窗口隐藏后界面循环可能不再产帧，这里直接用系统接口恢复窗口，
+    // 保证托盘单击/菜单在任何情况下都能唤回或退出。
+    tray_icon::TrayIconEvent::set_event_handler(Some(|ev| {
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        let show = match ev {
+            TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => true,
+            TrayIconEvent::DoubleClick { .. } => true,
+            _ => false,
+        };
+        if show {
+            restore_main_window();
+        }
+    }));
+    tray_icon::menu::MenuEvent::set_event_handler(Some(Arc::new(
+        |ev: tray_icon::menu::MenuEvent| match ev.id.0.as_str() {
+            "show" => restore_main_window(),
+            "quit" => std::process::exit(0),
+            _ => {}
+        },
+    )));
+    Some(tray)
+}
+
+/// 找到本进程主窗口并隐藏（关闭按钮走这里，托盘图标仍在）。
+fn hide_main_window() {
+    if let Some(hwnd) = main_hwnd() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd: i32) -> i32;
+        }
+        unsafe { ShowWindow(hwnd, 0 /* SW_HIDE */) };
+    }
+}
+
+/// 枚举本进程带标题的顶层窗口（即主窗口）。
+fn main_hwnd() -> Option<*mut std::ffi::c_void> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe extern "system" fn cb(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == std::process::id() && GetWindowTextLengthW(hwnd) > 0 {
+                *(lparam as *mut *mut std::ffi::c_void) = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+    let mut found: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe { EnumWindows(cb, &mut found as *mut _ as isize) };
+    if found.is_null() { None } else { Some(found) }
+}
+
+/// 找到本进程主窗口并显示、置前（隐藏状态下同样有效）。
+fn restore_main_window() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: *mut std::ffi::c_void) -> i32;
+        fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe extern "system" fn cb(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == std::process::id() && GetWindowTextLengthW(hwnd) > 0 {
+                *(lparam as *mut *mut std::ffi::c_void) = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+    let mut found: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe {
+        EnumWindows(cb, &mut found as *mut _ as isize);
+        if !found.is_null() {
+            ShowWindow(found, 5 /* SW_SHOW */);
+            ShowWindow(found, 9 /* SW_RESTORE */);
+            SetForegroundWindow(found);
+        }
+    }
+}
+
 // ---------------------------------------------------- URL 点击
 
 /// 点击 URL 的处理动作。
@@ -2826,6 +3292,74 @@ mod tests {
         assert_eq!(act2, UrlAction::Browser("1.2.3.4/x".into()));
         let (_, act3) = url_at("1.2.3.4?q=1", 3).unwrap();
         assert_eq!(act3, UrlAction::Browser("1.2.3.4?q=1".into()));
+    }
+
+    #[test]
+    fn img_zoom_limits() {
+        let avail = vec2(4000.0, 4000.0);
+        let nat = vec2(800.0, 600.0);
+        // 初始：适应基准框，比例不变
+        let s1 = img_zoom_size(nat, 1.0, avail);
+        assert!((s1.x / s1.y - 800.0 / 600.0).abs() < 0.01);
+        // 放大到极限：不超过 1920×1440
+        let big = img_zoom_size(nat, 40.0, avail);
+        assert!(big.x <= 1920.0 + 0.5 && big.y <= 1440.0 + 0.5);
+        assert!((big.x / big.y - 800.0 / 600.0).abs() < 0.01);
+        // 缩小到极限：两边都不小于 100
+        let small = img_zoom_size(nat, 0.05, avail);
+        assert!(small.x >= 99.5 && small.y >= 99.5);
+        // 细长图：下限按短边满足 100
+        let wide = img_zoom_size(vec2(2000.0, 200.0), 0.05, avail);
+        assert!(wide.y >= 99.5);
+        // 可视区不足时整体缩小，保证不截断
+        let fit = img_zoom_size(nat, 40.0, vec2(600.0, 400.0));
+        assert!(fit.x <= 600.0 + 0.5 && fit.y <= 400.0 + 0.5);
+    }
+
+    #[test]
+    fn img_scale_bounds_no_dead_zone() {
+        let nat = vec2(800.0, 600.0);
+        let avail = vec2(4000.0, 4000.0);
+        let (lo, hi) = img_scale_bounds(nat, avail);
+        assert!(lo < hi);
+        // 边界处继续放大：钳制后倍数不变，反向一次即缩小
+        let mut s = hi;
+        for _ in 0..3 {
+            s = (s * 1.15).clamp(lo, hi);
+        }
+        assert!((s - hi).abs() < 1e-3);
+        let before = img_zoom_size(nat, s, avail);
+        s = (s / 1.15).clamp(lo, hi);
+        let after = img_zoom_size(nat, s, avail);
+        assert!(after.x < before.x - 1.0);
+        // 最小端同理
+        let mut s = lo;
+        for _ in 0..3 {
+            s = (s / 1.15).clamp(lo, hi);
+        }
+        assert!((s - lo).abs() < 1e-3);
+        let before = img_zoom_size(nat, s, avail);
+        s = (s * 1.15).clamp(lo, hi);
+        assert!(img_zoom_size(nat, s, avail).x > before.x + 1.0);
+        // 边界尺寸正好落在限制上
+        let big = img_zoom_size(nat, hi, avail);
+        assert!(big.x <= 1920.0 + 0.5 && big.y <= 1440.0 + 0.5);
+        let small = img_zoom_size(nat, lo, avail);
+        assert!(small.x >= 99.5 && small.y >= 99.5);
+    }
+
+    #[test]
+    fn bare_ip_token_rules() {
+        assert_eq!(bare_ip_token("8.8.8.8").as_deref(), Some("8.8.8.8"));
+        // 掩码按旧逻辑补 0
+        assert_eq!(bare_ip_token("1.2.3.*").as_deref(), Some("1.2.3.0"));
+        assert_eq!(bare_ip_token("202.120.*.*").as_deref(), Some("202.120.0.0"));
+        // 带协议/路径/查询的一律不算纯 IP
+        assert!(bare_ip_token("http://8.8.8.8").is_none());
+        assert!(bare_ip_token("8.8.8.8/x").is_none());
+        assert!(bare_ip_token("8.8.8.8?q=1").is_none());
+        assert!(bare_ip_token("bbs.fudan.edu.cn").is_none());
+        assert!(bare_ip_token("1.2.3").is_none());
     }
 
     #[test]

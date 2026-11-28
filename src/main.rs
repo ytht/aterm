@@ -3,7 +3,9 @@
 
 mod config;
 mod dialogs;
+mod geoip;
 mod gui;
+mod imgprev;
 mod net;
 mod term;
 mod zhconv;

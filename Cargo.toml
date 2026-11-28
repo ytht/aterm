@@ -1,6 +1,6 @@
 [package]
 name = "aterm"
-version = "0.2.6"
+version = "0.3.3"
 edition = "2024"
 description = "ATerm —— 面向 BBS 的 Telnet/SSH 终端客户端"
 
@@ -24,12 +24,19 @@ russh = { version = "0.65", default-features = false, features = [
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 tokio-socks = "0.5"
 arboard = "3.7"
-image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+image = { version = "0.25", default-features = false, features = [
+    "png", "ico", "jpeg", "gif", "bmp", "webp",
+] }
 encoding_rs = "0.8"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "7"
+tray-icon = "0.27.0"
+muda = "0.22.0"
+maxminddb = "0.33.0"
+tar = "0.4.46"
+flate2 = "1.1.11"
 
 [profile.release]
 opt-level = 2
