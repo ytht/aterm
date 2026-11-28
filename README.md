@@ -48,9 +48,11 @@ cargo test
 
 ## 快捷键
 
-- `F2` 地址簿 · `F4` 设置
 - `Ctrl+Insert` 复制 · `Shift+Insert` 粘贴
 - 滚轮上/下 = 向 BBS 发送 PgUp/PgDn
 - `Ctrl+Shift+R` 断线重连 · `Ctrl+Shift+W` 关闭标签
 - `Ctrl+Shift+M` 按键宏全局开关
-- 右键终端：复制/粘贴/清选区/重连/站点编辑；右键标签：关闭/属性
+
+## 其他
+第一次鼠标悬浮于IP地址时，会从远程下载IP数据库，用于显示IP所在地
+地址簿中改名保存会添加新地址，沿用了FTerm的特性
